@@ -1,14 +1,36 @@
+"""
+Face Biometrics (InsightFace) + MediaPipe PoseLandmarker (Tasks)
+UI: cv2.imshow (fast)
+
+Controls:
+  Q - quit
+  P - toggle Pose MODEL (real start/stop; creates/closes landmarker)
+"""
+
+import os
 import cv2
 import time
-import threading
 import uuid
+import threading
+import urllib.request
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
-from numpy.linalg import norm
+
 from insightface.app import FaceAnalysis
 
+# ---------------------------
+# Optional: MediaPipe Tasks
+# ---------------------------
+try:
+    import mediapipe as mp
+    MP_IMPORTED = True
+except Exception:
+    mp = None
+    MP_IMPORTED = False
+
 BBox = Tuple[int, int, int, int]
+
 
 # ==========================
 # CONFIG
@@ -17,242 +39,228 @@ CAMERA_SOURCE: Union[int, str] = 0
 
 MODEL_PACK_NAME = "buffalo_s"
 USE_GPU = False
-DET_SIZE = (640, 640)
+DET_SIZE = (320, 320)
 
 INFER_HZ = 6
-SCALE = 0.5
+SCALE = 1.0  # если хочешь быстрее: 0.75/0.6/0.5
 
-WINDOW_NAME = "Face Biometrics (enroll merge to known)"
+WINDOW_NAME = "Face Biometrics Demo"
 
-# Узнавание (когда считаем, что это точно он)
 SIM_THRESHOLD = 0.58
-# "мягкое" узнавание — считаем, что это он (чтобы не плодить UID),
-# и если был enroll-буфер — присоединим его к этому uid.
 SOFT_MATCH_THRESHOLD = 0.50
 
-# Enrollment: сколько эмбеддингов собрать, чтобы создать НОВЫЙ uid
 ENROLL_MIN_SAMPLES = 6
 ENROLL_MAX_SECONDS = 3.0
-ENROLL_MIN_INTERNAL_SIM = 0.40  # качество буфера (чтобы не смешать 2 разных)
+ENROLL_MIN_INTERNAL_SIM = 0.40
 
-# Галерея: несколько эмбеддингов на uid
 MAX_EMBS_PER_UID = 40
-# при bulk-merge не добавляем почти дубликаты
 MERGE_SKIP_IF_MAXSIM_ABOVE = 0.93
+
+# ВАЖНО: фильтр для "безопасного merge"
+# эмбеддинг из enroll-буфера добавляем в uid только если он достаточно похож на uid
+MERGE_FILTER_THRESHOLD = 0.55
 
 MIN_FACE_SIZE = 40
 
-# "Сессии" (очень лёгкая связка по bbox IoU)
 SESSION_IOU_MATCH = 0.30
 SESSION_TTL_SEC = 1.2
 
-# ==========================
-# Utils
-# ==========================
-def l2_normalize(v: np.ndarray) -> np.ndarray:
-    n = norm(v)
-    if n <= 1e-12:
-        return v.astype(np.float32)
-    return (v / n).astype(np.float32)
+AVATAR_SZ = 56
+FOCUS_THICK = 4
+NORMAL_THICK = 2
 
-def cosine(a_norm: np.ndarray, b_norm: np.ndarray) -> float:
-    return float(np.dot(a_norm, b_norm))
+BOTTOM_BAR_H = 120
+BOTTOM_MARGIN = 10
+BOTTOM_CARD_H = 90
+BOTTOM_CARD_W = 230
+BOTTOM_GAP = 10
+BOTTOM_MAX_CARDS = 5
 
+# Enrollment quality gate
+ENROLL_USE_QUALITY_FILTER = True
+MIN_BLUR_VAR = 35.0
+MIN_BRIGHTNESS = 40.0
+MAX_BRIGHTNESS = 220.0
+
+# --------------------------
+# PoseLandmarker (MediaPipe)
+# --------------------------
+POSE_HZ = 10
+POSE_NUM_POSES = 2
+POSE_MIN_DET = 0.5
+POSE_MIN_PRES = 0.5
+POSE_MIN_TRACK = 0.5
+
+POSE_DRAW_LANDMARKS = True
+POSE_DRAW_CONNECTIONS = True
+
+HIDE_FACE_SKELETON = True
+FACE_LM_MAX = 10  # 0..10 = head/face landmarks in MediaPipe Pose
+
+MODEL_URL_FULL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
+)
+DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+POSE_MODEL_PATH = os.path.join(DEFAULT_MODEL_DIR, "pose_landmarker_full.task")
+
+POSE_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 7),
+    (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10),
+    (11, 12),
+    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24),
+    (23, 24),
+    (23, 25), (25, 27), (27, 29), (29, 31), (27, 31),
+    (24, 26), (26, 28), (28, 30), (30, 32), (28, 32),
+]
+
+
+# ==========================
+# Low-level utils (fast)
+# ==========================
 def clamp_int(v: float, lo: int, hi: int) -> int:
-    return max(lo, min(int(v), hi))
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return int(v)
+
+def bbox_area(bb: BBox) -> int:
+    x1, y1, x2, y2 = bb
+    w = x2 - x1
+    h = y2 - y1
+    return (w * h) if (w > 0 and h > 0) else 0
 
 def iou(a: BBox, b: BBox) -> float:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    ix1 = ax1 if ax1 > bx1 else bx1
+    iy1 = ay1 if ay1 > by1 else by1
+    ix2 = ax2 if ax2 < bx2 else bx2
+    iy2 = ay2 if ay2 < by2 else by2
+    iw = ix2 - ix1
+    ih = iy2 - iy1
+    if iw <= 0 or ih <= 0:
+        return 0.0
     inter = iw * ih
-    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
     denom = area_a + area_b - inter
     return (inter / denom) if denom > 0 else 0.0
 
-def bbox_center(bb: BBox) -> Tuple[float, float]:
+def safe_crop(img: np.ndarray, bb: BBox) -> Optional[np.ndarray]:
     x1, y1, x2, y2 = bb
-    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-# ==========================
-# Gallery DB: uid -> multiple embeddings
-# ==========================
-@dataclass
-class Identity:
-    uid: str
-    embs: List[np.ndarray] = field(default_factory=list)  # normalized
-    centroid: Optional[np.ndarray] = None                 # normalized
-
-    def recompute_centroid(self) -> None:
-        if not self.embs:
-            self.centroid = None
-            return
-        c = np.mean(np.stack(self.embs, axis=0), axis=0)
-        self.centroid = l2_normalize(c)
-
-class GalleryDB:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.ids: Dict[str, Identity] = {}
-
-    def _best_sim_to_identity(self, emb_norm: np.ndarray, ident: Identity) -> float:
-        best = -1.0
-        # быстрый фильтр: centroid
-        if ident.centroid is not None:
-            best = cosine(emb_norm, ident.centroid)
-        # точный по всем эмбеддингам
-        for e in ident.embs:
-            s = cosine(emb_norm, e)
-            if s > best:
-                best = s
-        return best
-
-    def find_best(self, emb_norm: np.ndarray) -> Tuple[Optional[str], float]:
-        with self.lock:
-            if not self.ids:
-                return None, -1.0
-
-            best_uid = None
-            best_score = -1.0
-            for uid, ident in self.ids.items():
-                s = self._best_sim_to_identity(emb_norm, ident)
-                if s > best_score:
-                    best_score = s
-                    best_uid = uid
-            return best_uid, best_score
-
-    def create_identity_from_enroll(self, enroll_embs: List[np.ndarray]) -> str:
-        uid = str(uuid.uuid4())
-        with self.lock:
-            ident = Identity(uid=uid, embs=list(enroll_embs))
-            # ограничение
-            if len(ident.embs) > MAX_EMBS_PER_UID:
-                ident.embs = ident.embs[-MAX_EMBS_PER_UID:]
-            ident.recompute_centroid()
-            self.ids[uid] = ident
-        return uid
-
-    def merge_enroll_into_uid(self, uid: str, enroll_embs: List[np.ndarray]) -> int:
-        """
-        Добавить эмбеддинги из enroll к существующему uid.
-        Возвращает: сколько реально добавили (после фильтра дублей).
-        """
-        if not enroll_embs:
-            return 0
-
-        with self.lock:
-            ident = self.ids.get(uid)
-            if ident is None:
-                # если uid вдруг исчез — создадим как новый
-                self.ids[uid] = Identity(uid=uid, embs=list(enroll_embs))
-                self.ids[uid].recompute_centroid()
-                return len(enroll_embs)
-
-            added = 0
-            for emb in enroll_embs:
-                # фильтр дублей: если слишком похож на уже имеющиеся, пропускаем
-                max_sim = -1.0
-                for e in ident.embs:
-                    s = cosine(emb, e)
-                    if s > max_sim:
-                        max_sim = s
-
-                if max_sim >= MERGE_SKIP_IF_MAXSIM_ABOVE:
-                    continue
-
-                ident.embs.append(emb)
-                added += 1
-
-                if len(ident.embs) > MAX_EMBS_PER_UID:
-                    ident.embs.pop(0)
-
-            if added > 0:
-                ident.recompute_centroid()
-
-            return added
-
-    def size(self) -> int:
-        with self.lock:
-            return len(self.ids)
-
-    def emb_count(self, uid: str) -> int:
-        with self.lock:
-            ident = self.ids.get(uid)
-            return len(ident.embs) if ident else 0
-
-
-# ==========================
-# Light session buffer (not tracking UI) for enroll
-# ==========================
-@dataclass
-class FaceSession:
-    sid: int
-    last_bbox: BBox
-    last_seen: float
-    uid: Optional[str] = None
-
-    enroll_embs: List[np.ndarray] = field(default_factory=list)
-    enroll_started: float = 0.0
-
-class SessionManager:
-    def __init__(self):
-        self.next_sid = 1
-        self.sessions: List[FaceSession] = []
-
-    def _match_session(self, bb: BBox) -> Optional[FaceSession]:
-        best = None
-        best_iou = 0.0
-        for s in self.sessions:
-            sc = iou(s.last_bbox, bb)
-            if sc > best_iou:
-                best_iou = sc
-                best = s
-        if best is not None and best_iou >= SESSION_IOU_MATCH:
-            return best
+    H, W = img.shape[:2]
+    x1 = 0 if x1 < 0 else (W - 1 if x1 >= W else x1)
+    x2 = 0 if x2 < 0 else (W if x2 > W else x2)
+    y1 = 0 if y1 < 0 else (H - 1 if y1 >= H else y1)
+    y2 = 0 if y2 < 0 else (H if y2 > H else y2)
+    if x2 <= x1 or y2 <= y1:
         return None
+    return img[y1:y2, x1:x2]
 
-    def update_sessions(self, det_bboxes: List[BBox], now: float) -> List[FaceSession]:
-        # purge old
-        self.sessions = [s for s in self.sessions if (now - s.last_seen) <= SESSION_TTL_SEC]
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n <= 1e-12:
+        return v.astype(np.float32, copy=False)
+    return (v / n).astype(np.float32, copy=False)
 
-        updated: List[FaceSession] = []
-        used_sid = set()
+def cosine(a_norm: np.ndarray, b_norm: np.ndarray) -> float:
+    return float(a_norm @ b_norm)
 
-        for bb in det_bboxes:
-            s = self._match_session(bb)
-            if s is None or s.sid in used_sid:
-                s = FaceSession(
-                    sid=self.next_sid,
-                    last_bbox=bb,
-                    last_seen=now,
-                    uid=None,
-                    enroll_embs=[],
-                    enroll_started=0.0
-                )
-                self.next_sid += 1
-                self.sessions.append(s)
-            else:
-                s.last_bbox = bb
-                s.last_seen = now
-
-            used_sid.add(s.sid)
-            updated.append(s)
-
-        return updated
+def quality_ok_for_enroll(crop_bgr: np.ndarray) -> bool:
+    if crop_bgr is None or crop_bgr.size == 0:
+        return False
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    mean = float(gray.mean())
+    if mean < MIN_BRIGHTNESS or mean > MAX_BRIGHTNESS:
+        return False
+    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return blur >= MIN_BLUR_VAR
 
 
 # ==========================
-# Async camera
+# MediaPipe availability
+# ==========================
+def mp_tasks_available() -> bool:
+    if not MP_IMPORTED or mp is None:
+        return False
+    return (
+        hasattr(mp, "tasks")
+        and hasattr(mp.tasks, "vision")
+        and hasattr(mp, "Image")
+        and hasattr(mp, "ImageFormat")
+    )
+
+ENABLE_POSE = mp_tasks_available()
+
+def ensure_pose_model(local_path: str) -> str:
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    if not os.path.isfile(local_path):
+        print(f">>> Pose model not found. Downloading:\n    {MODEL_URL_FULL}\n -> {local_path}")
+        urllib.request.urlretrieve(MODEL_URL_FULL, local_path)
+        print(">>> Pose model downloaded.")
+    return os.path.abspath(local_path)
+
+
+# ==========================
+# Diagnostics + shared state
+# ==========================
+@dataclass
+class Diagnostics:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    face_last_at: float = 0.0
+    face_last_err: str = ""
+    pose_state: str = "OFF"  # OFF/ON/ERR/UNAVAILABLE
+    pose_count: int = 0
+    pose_last_at: float = 0.0
+    pose_last_err: str = ""
+
+    def set(self, **kwargs):
+        with self.lock:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "face_last_at": self.face_last_at,
+                "face_last_err": self.face_last_err,
+                "pose_state": self.pose_state,
+                "pose_count": self.pose_count,
+                "pose_last_at": self.pose_last_at,
+                "pose_last_err": self.pose_last_err,
+            }
+
+@dataclass
+class SharedState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    vis: List[dict] = field(default_factory=list)
+    infer_ms: float = 0.0
+
+    pose_lock: threading.Lock = field(default_factory=threading.Lock)
+    pose_landmarks: List = field(default_factory=list)
+    pose_ms: float = 0.0
+    pose_at: float = 0.0
+
+
+# ==========================
+# Async camera (zero-copy read)
 # ==========================
 class AsyncCameraStream:
+    """
+    Важно: get_latest_frame() возвращает ССЫЛКУ на np.ndarray (без copy).
+    Это безопасно, если потребители НЕ МОДИФИЦИРУЮТ исходный кадр.
+    UI рисует на frame.copy(), воркеры читают.
+    """
     def __init__(self, source, reconnect_delay: float = 1.0):
         self.source = source
         self.reconnect_delay = reconnect_delay
         self.lock = threading.Lock()
-        self._frame = None
+        self._frame: Optional[np.ndarray] = None
         self._stop = threading.Event()
         self._cap = None
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -301,9 +309,9 @@ class AsyncCameraStream:
             with self.lock:
                 self._frame = frame
 
-    def get_latest_frame(self):
+    def get_latest_frame(self) -> Optional[np.ndarray]:
         with self.lock:
-            return self._frame.copy() if self._frame is not None else None
+            return self._frame
 
     def stop(self):
         self._stop.set()
@@ -320,8 +328,7 @@ class AsyncCameraStream:
 # InsightFace init
 # ==========================
 def init_insightface():
-    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
-                 if USE_GPU else ["CPUExecutionProvider"])
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"] if USE_GPU else ["CPUExecutionProvider"])
     app = FaceAnalysis(
         name=MODEL_PACK_NAME,
         providers=providers,
@@ -332,230 +339,945 @@ def init_insightface():
 
 
 # ==========================
-# Shared inference results (for UI)
+# Gallery DB (vectorized)
 # ==========================
-state_lock = threading.Lock()
-latest_vis = []          # list of dicts: bbox, label, color
-latest_infer_ms = 0.0
-latest_infer_at = 0.0
+@dataclass
+class Identity:
+    uid: str
+    embs: List[np.ndarray] = field(default_factory=list)        # list of (D,)
+    emb_mat: Optional[np.ndarray] = None                        # (N, D)
+    centroid: Optional[np.ndarray] = None                       # (D,)
+    avatar: Optional[np.ndarray] = None                         # (AV, AV, 3)
+
+    def _rebuild_mat(self):
+        if not self.embs:
+            self.emb_mat = None
+            return
+        self.emb_mat = np.stack(self.embs, axis=0).astype(np.float32, copy=False)
+
+    def recompute_centroid(self) -> None:
+        if not self.embs:
+            self.centroid = None
+            self.emb_mat = None
+            return
+        self._rebuild_mat()
+        c = self.emb_mat.mean(axis=0)
+        self.centroid = l2_normalize(c)
+
+    def best_sim(self, emb_norm: np.ndarray) -> float:
+        best = -1.0
+        if self.centroid is not None:
+            best = float(self.centroid @ emb_norm)
+        if self.emb_mat is not None and self.emb_mat.shape[0] > 0:
+            sims = self.emb_mat @ emb_norm
+            m = float(sims.max())
+            if m > best:
+                best = m
+        return best
 
 
-def infer_worker(app: FaceAnalysis, cam: AsyncCameraStream, db: GalleryDB,
-                 sess_mgr: SessionManager, stop_evt: threading.Event):
-    global latest_vis, latest_infer_ms, latest_infer_at
+class GalleryDB:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ids: Dict[str, Identity] = {}
 
-    period = 1.0 / max(1, INFER_HZ)
+    def find_best(self, emb_norm: np.ndarray) -> Tuple[Optional[str], float]:
+        with self.lock:
+            if not self.ids:
+                return None, -1.0
+            best_uid = None
+            best_score = -1.0
+            for uid, ident in self.ids.items():
+                s = ident.best_sim(emb_norm)
+                if s > best_score:
+                    best_score = s
+                    best_uid = uid
+            return best_uid, best_score
 
-    while not stop_evt.is_set():
-        t_start = time.time()
-        now = time.time()
+    def create_identity_from_enroll(self, enroll_embs: List[np.ndarray], avatar: Optional[np.ndarray]) -> str:
+        uid = str(uuid.uuid4())
+        if len(enroll_embs) > MAX_EMBS_PER_UID:
+            enroll_embs = enroll_embs[-MAX_EMBS_PER_UID:]
+        ident = Identity(uid=uid, embs=list(enroll_embs), avatar=avatar)
+        ident.recompute_centroid()
+        with self.lock:
+            self.ids[uid] = ident
+        return uid
 
-        frame = cam.get_latest_frame()
-        if frame is None:
-            time.sleep(0.01)
-            continue
+    def merge_enroll_into_uid(self, uid: str, enroll_embs: List[np.ndarray]) -> int:
+        if not enroll_embs:
+            return 0
+        with self.lock:
+            ident = self.ids.get(uid)
+            if ident is None:
+                ident = Identity(uid=uid, embs=list(enroll_embs))
+                if len(ident.embs) > MAX_EMBS_PER_UID:
+                    ident.embs = ident.embs[-MAX_EMBS_PER_UID:]
+                ident.recompute_centroid()
+                self.ids[uid] = ident
+                return len(enroll_embs)
 
-        small = cv2.resize(frame, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_LINEAR) if SCALE != 1.0 else frame
+            added = 0
+            if ident.emb_mat is None and ident.embs:
+                ident._rebuild_mat()
 
-        t0 = time.time()
-        faces = app.get(small)
-        infer_ms = (time.time() - t0) * 1000.0
+            for emb in enroll_embs:
+                if ident.emb_mat is not None and ident.emb_mat.shape[0] > 0:
+                    max_sim = float((ident.emb_mat @ emb).max())
+                else:
+                    max_sim = -1.0
+                if max_sim >= MERGE_SKIP_IF_MAXSIM_ABOVE:
+                    continue
+                ident.embs.append(emb)
+                added += 1
+                if len(ident.embs) > MAX_EMBS_PER_UID:
+                    ident.embs.pop(0)
 
-        H, W = frame.shape[:2]
+            if added > 0:
+                ident.recompute_centroid()
+            return added
 
-        dets: List[Tuple[BBox, np.ndarray]] = []
-        det_bboxes: List[BBox] = []
+    def filter_enroll_for_uid(self, uid: str, enroll_embs: List[np.ndarray], min_sim: float) -> Tuple[List[np.ndarray], int]:
+        """
+        Оставляет только те эмбеддинги, которые достаточно похожи на указанный uid.
+        Возвращает (kept_list, dropped_count).
+        """
+        if not enroll_embs:
+            return [], 0
 
-        for f in faces:
-            bb = f.bbox
-            if SCALE != 1.0:
-                bb = bb / SCALE
-            bb = bb.astype(int)
+        with self.lock:
+            ident = self.ids.get(uid)
+            if ident is None:
+                return [], len(enroll_embs)
 
-            x1 = clamp_int(bb[0], 0, W - 1)
-            y1 = clamp_int(bb[1], 0, H - 1)
-            x2 = clamp_int(bb[2], 0, W - 1)
-            y2 = clamp_int(bb[3], 0, H - 1)
+            if ident.centroid is None and ident.emb_mat is None and ident.embs:
+                ident.recompute_centroid()
+            elif ident.emb_mat is None and ident.embs:
+                ident._rebuild_mat()
 
-            if x2 <= x1 or y2 <= y1:
-                continue
-            if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE:
-                continue
+            mat = np.stack(enroll_embs, axis=0).astype(np.float32, copy=False)
 
-            emb = getattr(f, "embedding", None)
-            if emb is None:
-                continue
+            sims_best = None
+            if ident.centroid is not None:
+                sims_best = mat @ ident.centroid  # (M,)
 
-            emb_norm = l2_normalize(np.asarray(emb, dtype=np.float32))
+            if ident.emb_mat is not None and ident.emb_mat.shape[0] > 0:
+                sims_all = mat @ ident.emb_mat.T  # (M,N)
+                sims_max = sims_all.max(axis=1)   # (M,)
+                sims_best = sims_max if sims_best is None else np.maximum(sims_best, sims_max)
 
-            bbox = (x1, y1, x2, y2)
-            dets.append((bbox, emb_norm))
-            det_bboxes.append(bbox)
+            if sims_best is None:
+                return [], len(enroll_embs)
 
-        # sessions by bbox IoU
-        sessions = sess_mgr.update_sessions(det_bboxes, now)
+            keep_mask = sims_best >= float(min_sim)
+            kept = [enroll_embs[i] for i in range(len(enroll_embs)) if bool(keep_mask[i])]
+            dropped = int(len(enroll_embs) - len(kept))
+            return kept, dropped
 
-        # map each detection bbox -> its session (best IoU)
-        bbox_to_session: Dict[BBox, FaceSession] = {}
-        for bb, _ in dets:
+    def set_avatar_if_missing(self, uid: str, avatar: Optional[np.ndarray]) -> None:
+        if avatar is None:
+            return
+        with self.lock:
+            ident = self.ids.get(uid)
+            if ident and ident.avatar is None:
+                ident.avatar = avatar
+
+    def get_avatar(self, uid: str) -> Optional[np.ndarray]:
+        with self.lock:
+            ident = self.ids.get(uid)
+            return ident.avatar if ident else None
+
+    def size(self) -> int:
+        with self.lock:
+            return len(self.ids)
+
+
+# ==========================
+# Sessions (greedy IoU match)
+# ==========================
+@dataclass
+class FaceSession:
+    sid: int
+    bbox: BBox
+    last_seen: float
+    uid: Optional[str] = None
+
+    enroll_started: float = 0.0
+    enroll_embs: List[np.ndarray] = field(default_factory=list)
+    enroll_best_crop: Optional[np.ndarray] = None
+
+    first_seen: float = 0.0
+
+class SessionManager:
+    def __init__(self):
+        self.next_sid = 1
+        self.sessions: List[FaceSession] = []
+
+    def update(self, det_bboxes: List[BBox], now: float) -> Dict[int, FaceSession]:
+        alive = []
+        for s in self.sessions:
+            if (now - s.last_seen) <= SESSION_TTL_SEC:
+                alive.append(s)
+        self.sessions = alive
+
+        assigned: Dict[int, FaceSession] = {}
+        used_sessions = set()
+
+        for i, bb in enumerate(det_bboxes):
             best_s = None
             best_i = 0.0
-            for s in sessions:
-                sc = iou(s.last_bbox, bb)
+            for s in self.sessions:
+                if s.sid in used_sessions:
+                    continue
+                sc = iou(s.bbox, bb)
                 if sc > best_i:
                     best_i = sc
                     best_s = s
+
             if best_s is not None and best_i >= SESSION_IOU_MATCH:
-                bbox_to_session[bb] = best_s
+                best_s.bbox = bb
+                best_s.last_seen = now
+                assigned[i] = best_s
+                used_sessions.add(best_s.sid)
+            else:
+                snew = FaceSession(
+                    sid=self.next_sid,
+                    bbox=bb,
+                    last_seen=now,
+                    uid=None,
+                    first_seen=now
+                )
+                self.next_sid += 1
+                self.sessions.append(snew)
+                assigned[i] = snew
+                used_sessions.add(snew.sid)
 
-        vis = []
+        return assigned
 
-        for bb, emb_norm in dets:
-            s = bbox_to_session.get(bb)
-            if s is None:
-                # не должно часто случаться, но на всякий
-                s = FaceSession(sid=-1, last_bbox=bb, last_seen=now)
 
-            # Если у сессии есть uid — просто проверим (по желанию можно пропустить проверку)
-            if s.uid is not None:
-                best_uid, best_score = db.find_best(emb_norm)
-                if best_uid == s.uid and best_score >= SOFT_MATCH_THRESHOLD:
-                    label = f"{s.uid[:6]}.. ({best_score:.2f})"
-                    color = (0, 255, 0)
+# ==========================
+# Face inference worker
+# ==========================
+class FaceWorker:
+    def __init__(self, app: FaceAnalysis, cam: AsyncCameraStream, db: GalleryDB, sess_mgr: SessionManager,
+                 shared: SharedState, diag: Diagnostics, stop_evt: threading.Event):
+        self.app = app
+        self.cam = cam
+        self.db = db
+        self.sess_mgr = sess_mgr
+        self.shared = shared
+        self.diag = diag
+        self.stop_evt = stop_evt
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _merge_session_buffer_to_uid_safe(self, s: FaceSession, target_uid: str) -> Tuple[int, int]:
+        """
+        Безопасный merge:
+        - фильтруем enroll_embs по похожести на target_uid
+        - в merge отправляем только kept
+        Возвращает (added, dropped).
+        """
+        if not s.enroll_embs:
+            return 0, 0
+        kept, dropped = self.db.filter_enroll_for_uid(target_uid, s.enroll_embs, min_sim=MERGE_FILTER_THRESHOLD)
+        if not kept:
+            return 0, dropped
+        added = self.db.merge_enroll_into_uid(target_uid, kept)
+        return added, dropped
+
+    def run(self):
+        self.diag.set(face_last_err="", face_last_at=0.0)
+        period = 1.0 / max(1, INFER_HZ)
+
+        try:
+            while not self.stop_evt.is_set():
+                t_loop = time.time()
+                now = t_loop
+
+                frame = self.cam.get_latest_frame()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                H, W = frame.shape[:2]
+
+                if SCALE != 1.0:
+                    interp = cv2.INTER_AREA if SCALE < 1.0 else cv2.INTER_LINEAR
+                    small = cv2.resize(frame, None, fx=SCALE, fy=SCALE, interpolation=interp)
                 else:
-                    # потеряли связь — вернёмся к unknown/enroll
-                    s.uid = None
-                    s.enroll_embs.clear()
-                    s.enroll_started = 0.0
+                    small = frame
 
-            # Если uid нет — пробуем узнать
-            if s.uid is None:
-                best_uid, best_score = db.find_best(emb_norm)
+                if small.dtype != np.uint8:
+                    small = small.astype(np.uint8, copy=False)
 
-                if best_uid is not None and best_score >= SIM_THRESHOLD:
-                    # Узнали уверенно: если был enroll-буфер — присоединяем его к этому uid
-                    if s.enroll_embs:
-                        merged = db.merge_enroll_into_uid(best_uid, s.enroll_embs)
-                        print(f">>> MERGE enroll -> {best_uid[:6]}.. : +{merged} embs (buffer={len(s.enroll_embs)})")
-                        s.enroll_embs.clear()
-                        s.enroll_started = 0.0
+                t0 = time.time()
+                faces = self.app.get(small)
+                infer_ms = (time.time() - t0) * 1000.0
 
-                    s.uid = best_uid
-                    label = f"{best_uid[:6]}.. ({best_score:.2f})"
-                    color = (0, 255, 0)
+                dets: List[Tuple[BBox, np.ndarray, Optional[np.ndarray]]] = []
+                det_bboxes: List[BBox] = []
 
-                elif best_uid is not None and best_score >= SOFT_MATCH_THRESHOLD:
-                    # Мягко: считаем это он же (анти-дубликаты), и если был enroll — тоже мерджим
-                    if s.enroll_embs:
-                        merged = db.merge_enroll_into_uid(best_uid, s.enroll_embs)
-                        print(f">>> MERGE(enroll-soft) -> {best_uid[:6]}.. : +{merged} embs (buffer={len(s.enroll_embs)})")
-                        s.enroll_embs.clear()
-                        s.enroll_started = 0.0
+                for f in faces:
+                    bb = f.bbox
+                    if SCALE != 1.0:
+                        bb = bb / SCALE
+                    bb = bb.astype(np.int32, copy=False)
 
-                    s.uid = best_uid
-                    label = f"{best_uid[:6]}.. (~{best_score:.2f})"
-                    color = (0, 200, 255)
+                    x1 = clamp_int(bb[0], 0, W - 1)
+                    y1 = clamp_int(bb[1], 0, H - 1)
+                    x2 = clamp_int(bb[2], 0, W - 1)
+                    y2 = clamp_int(bb[3], 0, H - 1)
 
-                else:
-                    # Unknown -> enrollment buffer
-                    if s.enroll_started == 0.0:
-                        s.enroll_started = now
-                        s.enroll_embs = []
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE:
+                        continue
 
-                    s.enroll_embs.append(emb_norm)
+                    emb = getattr(f, "embedding", None)
+                    if emb is None:
+                        continue
 
-                    # time trim
-                    if (now - s.enroll_started) > ENROLL_MAX_SECONDS:
-                        s.enroll_started = now
-                        s.enroll_embs = [emb_norm]
+                    emb_norm = l2_normalize(np.asarray(emb, dtype=np.float32))
+                    bbox = (x1, y1, x2, y2)
 
-                    created_uid = None
-                    if len(s.enroll_embs) >= ENROLL_MIN_SAMPLES:
-                        c = l2_normalize(np.mean(np.stack(s.enroll_embs, axis=0), axis=0))
-                        min_sim = min(cosine(e, c) for e in s.enroll_embs)
-                        if min_sim >= ENROLL_MIN_INTERNAL_SIM:
-                            created_uid = db.create_identity_from_enroll(s.enroll_embs)
-                            s.uid = created_uid
-                            s.enroll_embs = []
+                    crop = safe_crop(frame, bbox)
+                    dets.append((bbox, emb_norm, crop))
+                    det_bboxes.append(bbox)
+
+                idx_to_sess = self.sess_mgr.update(det_bboxes, now)
+
+                vis_out: List[dict] = []
+
+                for idx, (bb, emb_norm, crop) in enumerate(dets):
+                    s = idx_to_sess.get(idx)
+                    if s is None:
+                        s = FaceSession(sid=-1, bbox=bb, last_seen=now, first_seen=now)
+
+                    label = ""
+                    color = (0, 0, 255)
+                    status = "unknown"
+                    score = -1.0
+
+                    best_uid, best_score = self.db.find_best(emb_norm)
+                    score = best_score
+
+                    # ----------------------------
+                    # KNOWN
+                    # + безопасный merge буфера, если он был
+                    # ----------------------------
+                    if best_uid is not None and best_score >= SIM_THRESHOLD:
+                        if s.enroll_embs:
+                            added, dropped = self._merge_session_buffer_to_uid_safe(s, best_uid)
+                            if added > 0 or dropped > 0:
+                                print(f">>> MERGE(buffer->KNOWN) {best_uid[:6]}.. +{added} drop={dropped} buf={len(s.enroll_embs)}")
+
+                            # буфер чистим всегда (не тащим мусор дальше)
                             s.enroll_started = 0.0
-                            print(f">>> NEW UID: {created_uid} (enroll={ENROLL_MIN_SAMPLES}, min_internal_sim={min_sim:.2f})")
+                            s.enroll_embs.clear()
+                            s.enroll_best_crop = None
 
-                    if created_uid is not None:
-                        label = f"NEW {created_uid[:6]}.."
-                        color = (0, 0, 255)
+                        s.uid = best_uid
+                        status = "known"
+                        label = f"{best_uid[:6]}.. ({best_score:.2f})"
+                        color = (0, 255, 0)
+
+                        if crop is not None and ((not ENROLL_USE_QUALITY_FILTER) or quality_ok_for_enroll(crop)):
+                            av = cv2.resize(crop, (AVATAR_SZ, AVATAR_SZ), interpolation=cv2.INTER_AREA)
+                            self.db.set_avatar_if_missing(best_uid, av)
+
+                    # ----------------------------
+                    # SOFT
+                    # + безопасный merge буфера, если он был
+                    # ----------------------------
+                    elif best_uid is not None and best_score >= SOFT_MATCH_THRESHOLD:
+                        if s.enroll_embs:
+                            added, dropped = self._merge_session_buffer_to_uid_safe(s, best_uid)
+                            if added > 0 or dropped > 0:
+                                print(f">>> MERGE(buffer->SOFT)  {best_uid[:6]}.. +{added} drop={dropped} buf={len(s.enroll_embs)}")
+
+                            s.enroll_started = 0.0
+                            s.enroll_embs.clear()
+                            s.enroll_best_crop = None
+
+                        s.uid = best_uid
+                        status = "soft"
+                        label = f"{best_uid[:6]}.. (~{best_score:.2f})"
+                        color = (0, 200, 255)
+
+                        if crop is not None and ((not ENROLL_USE_QUALITY_FILTER) or quality_ok_for_enroll(crop)):
+                            av = cv2.resize(crop, (AVATAR_SZ, AVATAR_SZ), interpolation=cv2.INTER_AREA)
+                            self.db.set_avatar_if_missing(best_uid, av)
+
+                    # ----------------------------
+                    # ENROLL
+                    # + когда буфер готов, сначала пытаемся merge в существующий uid
+                    #   и только потом создаём новый uid
+                    # ----------------------------
                     else:
-                        label = f"ENROLL {len(s.enroll_embs)}/{ENROLL_MIN_SAMPLES}"
-                        color = (0, 0, 255)
+                        if s.enroll_started == 0.0:
+                            s.enroll_started = now
+                            s.enroll_embs.clear()
+                            s.enroll_best_crop = None
 
-            # UI overlay
-            vis.append({"bbox": bb, "label": label, "color": color})
+                        can_add = True
+                        if ENROLL_USE_QUALITY_FILTER:
+                            can_add = (crop is not None) and quality_ok_for_enroll(crop)
 
-            # update session
-            s.last_bbox = bb
-            s.last_seen = now
+                        if can_add:
+                            s.enroll_embs.append(emb_norm)
+                            if s.enroll_best_crop is None and crop is not None:
+                                s.enroll_best_crop = crop
 
-        with state_lock:
-            latest_vis = vis
-            latest_infer_ms = infer_ms
-            latest_infer_at = time.time()
+                        if (now - s.enroll_started) > ENROLL_MAX_SECONDS:
+                            s.enroll_started = now
+                            s.enroll_embs = [emb_norm] if can_add else []
+                            s.enroll_best_crop = crop if can_add else None
 
-        elapsed = time.time() - t_start
-        sleep_left = period - elapsed
-        if sleep_left > 0:
-            time.sleep(sleep_left)
+                        created_uid = None
+                        merged_uid = None
+                        merged_added = 0
+                        merged_dropped = 0
+                        merged_score = -1.0
+
+                        n = len(s.enroll_embs)
+                        if n >= ENROLL_MIN_SAMPLES:
+                            mat = np.stack(s.enroll_embs, axis=0).astype(np.float32, copy=False)
+                            c = l2_normalize(mat.mean(axis=0))
+                            sims = mat @ c
+                            min_sim = float(sims.min())
+
+                            if min_sim >= ENROLL_MIN_INTERNAL_SIM:
+                                # 1) пробуем найти "кому принадлежит" весь буфер
+                                uid_c, sc = self.db.find_best(c)
+                                merged_score = float(sc)
+
+                                if uid_c is not None and sc >= SOFT_MATCH_THRESHOLD:
+                                    # 2) безопасный merge: не весь буфер, а только подходящие эмбеддинги
+                                    kept, dropped = self.db.filter_enroll_for_uid(uid_c, s.enroll_embs, min_sim=MERGE_FILTER_THRESHOLD)
+                                    merged_dropped = dropped
+                                    if kept:
+                                        merged_uid = uid_c
+                                        merged_added = self.db.merge_enroll_into_uid(uid_c, kept)
+
+                                        if s.enroll_best_crop is not None:
+                                            av = cv2.resize(s.enroll_best_crop, (AVATAR_SZ, AVATAR_SZ), interpolation=cv2.INTER_AREA)
+                                            self.db.set_avatar_if_missing(uid_c, av)
+
+                                        s.uid = uid_c
+                                        s.enroll_started = 0.0
+                                        s.enroll_embs.clear()
+                                        s.enroll_best_crop = None
+
+                                        print(
+                                            f">>> MERGE-BUFFER -> {uid_c[:6]}.. "
+                                            f"score={sc:.2f} +{merged_added} drop={merged_dropped} buf={n} min_internal={min_sim:.2f}"
+                                        )
+                                    else:
+                                        # буфер вроде похож, но ни один эмбеддинг не прошёл фильтр => лучше создать новый uid
+                                        merged_uid = None
+
+                                if merged_uid is None:
+                                    avatar = None
+                                    if s.enroll_best_crop is not None:
+                                        avatar = cv2.resize(s.enroll_best_crop, (AVATAR_SZ, AVATAR_SZ), interpolation=cv2.INTER_AREA)
+                                    created_uid = self.db.create_identity_from_enroll(s.enroll_embs, avatar=avatar)
+
+                                    s.uid = created_uid
+                                    s.enroll_started = 0.0
+                                    s.enroll_embs.clear()
+                                    s.enroll_best_crop = None
+
+                                    print(f">>> NEW UID: {created_uid[:6]}.. (min_internal_sim={min_sim:.2f})")
+
+                        if merged_uid is not None:
+                            if merged_score >= SIM_THRESHOLD:
+                                status = "known"
+                                label = f"{merged_uid[:6]}.. ({merged_score:.2f}) +M{merged_added}"
+                                color = (0, 255, 0)
+                            else:
+                                status = "soft"
+                                label = f"{merged_uid[:6]}.. (~{merged_score:.2f}) +M{merged_added}"
+                                color = (0, 200, 255)
+
+                        elif created_uid is not None:
+                            status = "new"
+                            label = f"NEW {created_uid[:6]}.."
+                            color = (255, 0, 255)
+
+                        else:
+                            status = "enroll"
+                            label = f"ENROLL {len(s.enroll_embs)}/{ENROLL_MIN_SAMPLES}"
+                            color = (0, 0, 255)
+
+                    s.bbox = bb
+                    s.last_seen = now
+
+                    vis_out.append({
+                        "bbox": bb,
+                        "sid": s.sid,
+                        "uid": s.uid,
+                        "label": label,
+                        "color": color,
+                        "status": status,
+                        "score": float(score),
+                        "first_seen": float(s.first_seen),
+                        "enroll_n": int(len(s.enroll_embs)),
+                        "area": int(bbox_area(bb)),
+                    })
+
+                with self.shared.lock:
+                    self.shared.vis = vis_out
+                    self.shared.infer_ms = float(infer_ms)
+
+                self.diag.set(face_last_at=time.time(), face_last_err="")
+
+                sleep_left = period - (time.time() - t_loop)
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
+
+        except Exception:
+            import traceback
+            err = traceback.format_exc()
+            print(">>> FACE THREAD CRASH:\n", err)
+            self.diag.set(face_last_err=err, face_last_at=time.time())
+        finally:
+            self.diag.set(face_last_at=time.time())
 
 
+# ==========================
+# Pose controller (VIDEO mode)
+# ==========================
+class PoseController:
+    def __init__(self, cam: AsyncCameraStream, model_path: str, shared: SharedState, diag: Diagnostics):
+        self.cam = cam
+        self.model_path = model_path
+        self.shared = shared
+        self.diag = diag
+
+        self._stop_evt: Optional[threading.Event] = None
+        self._thread: Optional[threading.Thread] = None
+        self.enabled = False
+
+    def start(self):
+        if not ENABLE_POSE:
+            self.diag.set(pose_state="UNAVAILABLE", pose_last_err="MediaPipe Tasks API not available (pip install mediapipe)")
+            return
+        if self.enabled:
+            return
+        if not os.path.isfile(self.model_path):
+            self.diag.set(pose_state="ERR", pose_last_err=f"Pose model file not found: {self.model_path}")
+            return
+
+        stop_evt = threading.Event()
+        self._stop_evt = stop_evt
+
+        def runner():
+            landmarker = None
+            try:
+                BaseOptions = mp.tasks.BaseOptions
+                PoseLandmarker = mp.tasks.vision.PoseLandmarker
+                PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+                RunningMode = mp.tasks.vision.RunningMode
+
+                options = PoseLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_path=self.model_path),
+                    running_mode=RunningMode.VIDEO,
+                    num_poses=POSE_NUM_POSES,
+                    min_pose_detection_confidence=POSE_MIN_DET,
+                    min_pose_presence_confidence=POSE_MIN_PRES,
+                    min_tracking_confidence=POSE_MIN_TRACK,
+                    output_segmentation_masks=False,
+                )
+                landmarker = PoseLandmarker.create_from_options(options)
+                self.diag.set(pose_state="ON", pose_last_err="")
+
+                period = 1.0 / max(1, POSE_HZ)
+                last_ts = 0
+
+                while not stop_evt.is_set():
+                    t_loop = time.time()
+                    frame = self.cam.get_latest_frame()
+                    if frame is None:
+                        time.sleep(0.01)
+                        continue
+
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+
+                    ts_ms = int(time.time() * 1000)
+                    if ts_ms <= last_ts:
+                        ts_ms = last_ts + 1
+                    last_ts = ts_ms
+
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                    t0 = time.time()
+                    result = landmarker.detect_for_video(mp_image, ts_ms)
+                    ms = (time.time() - t0) * 1000.0
+
+                    poses = result.pose_landmarks if (result and getattr(result, "pose_landmarks", None)) else []
+                    now2 = time.time()
+
+                    with self.shared.pose_lock:
+                        self.shared.pose_landmarks = list(poses)
+                        self.shared.pose_ms = float(ms)
+                        self.shared.pose_at = float(now2)
+
+                    self.diag.set(pose_count=int(len(poses)), pose_last_at=float(now2))
+
+                    sleep_left = period - (time.time() - t_loop)
+                    if sleep_left > 0:
+                        time.sleep(sleep_left)
+
+            except Exception:
+                import traceback
+                err = traceback.format_exc()
+                print(">>> POSE THREAD CRASH:\n", err)
+                self.diag.set(pose_state="ERR", pose_last_err=err)
+            finally:
+                if landmarker is not None:
+                    try:
+                        landmarker.close()
+                    except Exception:
+                        pass
+                with self.shared.pose_lock:
+                    self.shared.pose_landmarks = []
+                    self.shared.pose_ms = 0.0
+                    self.shared.pose_at = 0.0
+                self.diag.set(pose_count=0, pose_last_at=0.0, pose_state="OFF")
+
+        self._thread = threading.Thread(target=runner, daemon=True)
+        self._thread.start()
+        self.enabled = True
+
+    def stop(self):
+        if not self.enabled:
+            return
+        if self._stop_evt is not None:
+            self._stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._stop_evt = None
+        self._thread = None
+        self.enabled = False
+        self.diag.set(pose_state="OFF")
+
+    def toggle(self):
+        if self.enabled:
+            self.stop()
+        else:
+            self.start()
+
+
+# ==========================
+# UI drawing
+# ==========================
+def draw_transparent_rect(img, x1, y1, x2, y2, alpha=0.6):
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
+
+def draw_bar(img, x, y, w, h, frac, color=(0, 255, 0), bg=(50, 50, 50)):
+    frac = 0.0 if frac < 0 else (1.0 if frac > 1.0 else float(frac))
+    cv2.rectangle(img, (x, y), (x + w, y + h), bg, -1)
+    cv2.rectangle(img, (x, y), (x + int(w * frac), y + h), color, -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (200, 200, 200), 1)
+
+def draw_card(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+              alpha=0.55, border=(255, 255, 255), border_th=1):
+    draw_transparent_rect(img, x1, y1, x2, y2, alpha=alpha)
+    if border_th > 0:
+        cv2.rectangle(img, (x1, y1), (x2, y2), border, border_th)
+
+def choose_focus(vis: List[dict]) -> Optional[dict]:
+    if not vis:
+        return None
+    def key(item):
+        pri = 0
+        st = item.get("status", "")
+        if st == "known":
+            pri = 4
+        elif st == "soft":
+            pri = 3
+        elif st == "enroll":
+            pri = 1
+        return (pri, item.get("area", 0), item.get("score", -1.0))
+    return max(vis, key=key)
+
+def draw_pose_overlay(display: np.ndarray, bar_y0: int, shared: SharedState, pose_draw_enabled: bool):
+    if not pose_draw_enabled or not ENABLE_POSE:
+        return
+    with shared.pose_lock:
+        poses = list(shared.pose_landmarks)
+    if not poses:
+        return
+
+    H, W = display.shape[:2]
+
+    def is_face_idx(idx: int) -> bool:
+        return HIDE_FACE_SKELETON and (0 <= idx <= FACE_LM_MAX)
+
+    if POSE_DRAW_CONNECTIONS:
+        for pose in poses:
+            for a, b in POSE_CONNECTIONS:
+                if a >= len(pose) or b >= len(pose):
+                    continue
+                if is_face_idx(a) or is_face_idx(b):
+                    continue
+                pa, pb = pose[a], pose[b]
+                xa, ya = int(pa.x * W), int(pa.y * H)
+                xb, yb = int(pb.x * W), int(pb.y * H)
+
+                xa = 0 if xa < 0 else (W - 1 if xa >= W else xa)
+                xb = 0 if xb < 0 else (W - 1 if xb >= W else xb)
+                ya = 0 if ya < 0 else (H - 1 if ya >= H else ya)
+                yb = 0 if yb < 0 else (H - 1 if yb >= H else yb)
+
+                if ya >= bar_y0 and yb >= bar_y0:
+                    continue
+                cv2.line(display, (xa, ya), (xb, yb), (255, 255, 255), 2)
+
+    if POSE_DRAW_LANDMARKS:
+        for pose in poses:
+            for idx, lm in enumerate(pose):
+                if is_face_idx(idx):
+                    continue
+                x, y = int(lm.x * W), int(lm.y * H)
+                x = 0 if x < 0 else (W - 1 if x >= W else x)
+                y = 0 if y < 0 else (H - 1 if y >= H else y)
+                if y >= bar_y0:
+                    continue
+                cv2.circle(display, (x, y), 3, (0, 255, 255), -1)
+
+def draw_bottom_db_bar(display: np.ndarray, vis: List[dict], db: GalleryDB, focus: Optional[dict]):
+    H, W = display.shape[:2]
+    bar_h = min(BOTTOM_BAR_H, H - 60)
+    y0 = H - bar_h
+    if y0 < 46:
+        return
+
+    draw_transparent_rect(display, 0, y0, W, H, alpha=0.55)
+    cv2.line(display, (0, y0), (W, y0), (255, 255, 255), 1)
+
+    cv2.putText(display, "DB", (12, y0 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
+    cv2.putText(display, f"IDs {db.size()}", (62, y0 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+    focus_sid = focus["sid"] if focus else None
+
+    def sort_key(it):
+        pri = 0
+        if it["sid"] == focus_sid:
+            pri = 5
+        elif it["status"] == "known":
+            pri = 4
+        elif it["status"] == "soft":
+            pri = 3
+        elif it["status"] == "enroll":
+            pri = 1
+        return (-pri, -it.get("area", 0))
+
+    rows = sorted(vis, key=sort_key)
+
+    y_card = y0 + 34
+    h_card = min(BOTTOM_CARD_H, bar_h - 44)
+    if h_card < 60:
+        return
+
+    max_cards_fit = (W - 2 * BOTTOM_MARGIN + BOTTOM_GAP) // (BOTTOM_CARD_W + BOTTOM_GAP)
+    max_cards = int(max(1, min(BOTTOM_MAX_CARDS, max_cards_fit)))
+
+    x = BOTTOM_MARGIN
+    for it in rows[:max_cards]:
+        uid = it.get("uid")
+        status = it.get("status", "unknown")
+        score = float(it.get("score", -1.0))
+        first_seen = float(it.get("first_seen", 0.0))
+
+        x1 = x
+        y1 = y_card
+        x2 = min(W - BOTTOM_MARGIN, x1 + BOTTOM_CARD_W)
+        y2 = y1 + h_card
+
+        border = (255, 255, 255) if it["sid"] == focus_sid else (140, 140, 140)
+        draw_card(display, x1, y1, x2, y2, alpha=0.42, border=border, border_th=1)
+
+        ax = x1 + 10
+        ay = y1 + 12
+
+        if uid:
+            av = db.get_avatar(uid)
+            if av is not None:
+                ah, aw = av.shape[:2]
+                if ay + ah <= H and ax + aw <= W:
+                    display[ay:ay + ah, ax:ax + aw] = av
+                cv2.rectangle(display, (ax, ay), (ax + AVATAR_SZ, ay + AVATAR_SZ), (200, 200, 200), 1)
+            else:
+                cv2.rectangle(display, (ax, ay), (ax + AVATAR_SZ, ay + AVATAR_SZ), (75, 75, 75), -1)
+        else:
+            cv2.rectangle(display, (ax, ay), (ax + AVATAR_SZ, ay + AVATAR_SZ), (65, 65, 65), -1)
+
+        tx = ax + AVATAR_SZ + 10
+        name = (uid[:6] + "..") if uid else f"Session {it['sid']}"
+        cv2.putText(display, name, (tx, ay + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1)
+
+        seen_time = time.strftime("%H:%M:%S", time.localtime(first_seen)) if first_seen else "--:--:--"
+        cv2.putText(display, f"first seen: {seen_time}", (tx, ay + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1)
+
+        if status in ("known", "soft"):
+            cv2.putText(display, f"{status} {score:.2f}", (tx, ay + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (210, 210, 210), 1)
+        elif status == "enroll":
+            cv2.putText(display, f"enroll {it.get('enroll_n', 0)}/{ENROLL_MIN_SAMPLES}",
+                        (tx, ay + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (210, 210, 210), 1)
+
+        x = x2 + BOTTOM_GAP
+        if x >= W - BOTTOM_MARGIN:
+            break
+
+def draw_top_debug_bar(display: np.ndarray, ui_fps: float, infer_ms: float, faces: int, ids: int,
+                       shared: SharedState, diag: Diagnostics):
+    H, W = display.shape[:2]
+    bar_h = 34
+    draw_transparent_rect(display, 0, 0, W, bar_h, alpha=0.55)
+    cv2.line(display, (0, bar_h), (W, bar_h), (255, 255, 255), 1)
+
+    d = diag.snapshot()
+
+    with shared.pose_lock:
+        pose_ms = float(shared.pose_ms)
+
+    line1 = f"UI {ui_fps:.1f}fps | Face {infer_ms:.0f}ms | Pose {pose_ms:.0f}ms | Faces {faces}"
+
+    cv2.putText(display, line1, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 1)
+
+    err = d.get("face_last_err", "") or d.get("pose_last_err", "")
+    if err:
+        first = err.strip().splitlines()[0][:160]
+        cv2.putText(display, f"ERR: {first}", (12, bar_h + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
+
+
+# ==========================
+# Main
+# ==========================
 def main():
-    print(">>> Init InsightFace (detection + recognition)...")
-    app = init_insightface()
+    cv2.setUseOptimized(True)
 
-    print(">>> Opening camera stream...")
+    print(">>> Starting...")
     cam = AsyncCameraStream(CAMERA_SOURCE)
+    time.sleep(0.2)
+
+    diag = Diagnostics()
+    shared = SharedState()
+
+    # InsightFace
+    try:
+        print(">>> Init InsightFace...")
+        app = init_insightface()
+        print(">>> InsightFace OK.")
+    except Exception:
+        import traceback
+        err = traceback.format_exc()
+        print(">>> InsightFace INIT FAILED:\n", err)
+        diag.set(face_last_err=err)
+        app = None
+
+    # MediaPipe
+    if MP_IMPORTED:
+        print(">>> mediapipe:", getattr(mp, "__version__", "unknown"))
+        print(">>> mp.tasks available:", mp_tasks_available())
+    else:
+        print(">>> mediapipe not installed.")
+
+    pose_ok = ENABLE_POSE
+    pose_model_abs = ""
+    if pose_ok:
+        try:
+            pose_model_abs = ensure_pose_model(POSE_MODEL_PATH)
+            print(">>> Pose model:", pose_model_abs)
+        except Exception:
+            import traceback
+            err = traceback.format_exc()
+            print(">>> Pose model download failed:\n", err)
+            diag.set(pose_last_err=err, pose_state="ERR")
+            pose_ok = False
+    else:
+        diag.set(pose_state="UNAVAILABLE")
 
     db = GalleryDB()
     sess_mgr = SessionManager()
-
     stop_evt = threading.Event()
-    t = threading.Thread(target=infer_worker, args=(app, cam, db, sess_mgr, stop_evt), daemon=True)
-    t.start()
+
+    # Face thread
+    if app is not None:
+        face_worker = FaceWorker(app, cam, db, sess_mgr, shared, diag, stop_evt)
+        face_worker.start()
+    else:
+        print(">>> Face thread not started (InsightFace init failed).")
+
+    # Pose controller
+    pose_ctl = PoseController(cam, model_path=pose_model_abs, shared=shared, diag=diag) if pose_ok else None
+    if pose_ctl is not None:
+        pose_ctl.start()  # start ON by default
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 960, 540)
+    cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
     fps_t0 = time.time()
     fps_frames = 0
     ui_fps = 0.0
+
+    print("Controls: Q - quit | P - toggle pose MODEL (real start/stop)")
 
     try:
         while True:
             frame = cam.get_latest_frame()
             if frame is None:
                 img = np.zeros((540, 960, 3), dtype=np.uint8)
-                cv2.putText(img, "WAITING FOR FRAMES...", (30, 270),
+                cv2.putText(img, "WAITING FOR CAMERA...", (30, 270),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
                 cv2.imshow(WINDOW_NAME, img)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
                 continue
 
             now = time.time()
-            with state_lock:
-                vis = list(latest_vis)
-                infer_ms = float(latest_infer_ms)
-                infer_at = float(latest_infer_at)
-
-            infer_age = (now - infer_at) if infer_at else 999.0
+            with shared.lock:
+                vis = list(shared.vis)
+                infer_ms = float(shared.infer_ms)
 
             display = frame.copy()
+            focus = choose_focus(vis)
+
+            bar_h = min(BOTTOM_BAR_H, display.shape[0] - 60)
+            bar_y0 = display.shape[0] - bar_h
+
+            pose_enabled = (pose_ctl.enabled if pose_ctl is not None else False)
+
+            draw_pose_overlay(display, bar_y0=bar_y0, shared=shared, pose_draw_enabled=pose_enabled)
 
             for item in vis:
                 x1, y1, x2, y2 = item["bbox"]
                 color = item["color"]
                 label = item["label"]
 
-                cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(display, label, (x1, max(20, y1 - 10)),
+                thick = FOCUS_THICK if (focus is not None and item["sid"] == focus["sid"]) else NORMAL_THICK
+                cv2.rectangle(display, (x1, y1), (x2, y2), color, thick)
+                cv2.putText(display, label, (x1, 24 if (y1 - 10) < 24 else (y1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+                if item["status"] == "enroll":
+                    bx = x1
+                    by = y2 + 6
+                    if by > bar_y0 - 14:
+                        by = 78 if (y1 - 14) < 78 else (y1 - 14)
+                    n = item.get("enroll_n", 0)
+                    frac = n / float(max(1, ENROLL_MIN_SAMPLES))
+                    draw_bar(display, bx, by, max(40, x2 - x1), 8, frac, color=(0, 0, 255))
+
+            draw_bottom_db_bar(display, vis, db, focus)
 
             fps_frames += 1
             if now - fps_t0 >= 1.0:
@@ -563,19 +1285,21 @@ def main():
                 fps_t0 = now
                 fps_frames = 0
 
-            stats = (
-                f"UI FPS:{ui_fps:.1f} | Infer:{infer_ms:.0f}ms @ {INFER_HZ}Hz "
-                f"| faces:{len(vis)} | infer_age:{infer_age*1000:.0f}ms | ids:{db.size()}"
-            )
-            cv2.putText(display, stats, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            draw_top_debug_bar(display, ui_fps=ui_fps, infer_ms=infer_ms, faces=len(vis), ids=db.size(),
+                               shared=shared, diag=diag)
 
             cv2.imshow(WINDOW_NAME, display)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            if key == ord('p') and pose_ctl is not None:
+                pose_ctl.toggle()
 
     finally:
         stop_evt.set()
+        if pose_ctl is not None:
+            pose_ctl.stop()
         cam.stop()
         cv2.destroyAllWindows()
 
